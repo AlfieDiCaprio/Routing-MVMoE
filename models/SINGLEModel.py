@@ -1,7 +1,23 @@
 import torch
+import math
 import torch.nn as nn
-import torch.nn.functional as F
+import revtorch as rv
 
+from torch import einsum
+from functools import partial
+
+from einops import rearrange
+from einops.layers.torch import Rearrange
+
+from scipy.fftpack import next_fast_len
+import torch.nn.functional as F
+from labml_helpers.module import Module
+
+import logging
+logger = logging.getLogger(__name__)
+
+
+from timm.models.layers import DropPath, trunc_normal_
 __all__ = ['SINGLEModel']
 
 
@@ -13,8 +29,15 @@ class SINGLEModel(nn.Module):
         self.eval_type = self.model_params['eval_type']
         self.problem = self.model_params['problem']
 
+        # 1-1 revnet based Encoder
+        # self.encoder = Rev_Encoder(**model_params)
+        # 1-2 residual based Encoder
         self.encoder = SINGLE_Encoder(**model_params)
-        self.decoder = SINGLE_Decoder(**model_params)
+        # 2-1 global and local attention based Decoder
+        self.decoder = Global_and_Local_Decoder(**model_params)
+        # 2-2 MHA based Decoder
+        # self.decoder = SINGLE_Decoder(**model_params)
+
         self.encoded_nodes = None
         self.device = torch.device('cuda', torch.cuda.current_device()) if 'device' not in model_params.keys() else model_params['device']
         # shape: (batch, problem+1, EMBEDDING_DIM)
@@ -135,6 +158,74 @@ def _get_encoding(encoded_nodes, node_index_to_pick):
 # ENCODER
 ########################################
 
+class Rev_Encoder(nn.Module):
+    # def __init__(
+    #     self,
+    #     n_layers: int,  # encoder_layer_num
+    #     n_heads: int,   # head_num
+    #     embedding_dim: int,   # embedding_dim
+    #     input_dim: int,       # /
+    #     intermediate_dim: int,    # ff_hidden_dim
+    #     add_init_projection=True, # /
+    # ):
+    def __init__(self, **model_params):
+        super().__init__()
+        self.model_params = model_params
+        self.problem = self.model_params['problem']
+        embedding_dim = self.model_params['embedding_dim']
+        encoder_layer_num = self.model_params['encoder_layer_num']
+        head_num = self.model_params['head_num']
+        intermediate_dim = self.model_params['ff_hidden_dim']
+        qkv_dim = self.model_params['qkv_dim']
+        # if add_init_projection or input_dim != embedding_dim:
+        #     self.init_projection_layer = torch.nn.Linear(input_dim, embedding_dim)
+        self.embedding_depot = nn.Linear(2, embedding_dim)
+        if self.problem in ["CVRP", "OVRP", "VRPB", "VRPL", "VRPBL", "OVRPB", "OVRPL", "OVRPBL"]:
+            self.embedding_node = nn.Linear(3, embedding_dim)
+        elif self.problem in ["VRPTW", "OVRPTW", "VRPBTW", "VRPLTW", "OVRPBTW", "OVRPLTW", "VRPBLTW", "OVRPBLTW"]:
+            self.embedding_node = nn.Linear(5, embedding_dim)
+        else:
+            raise NotImplementedError
+
+        self.num_hidden_layers = encoder_layer_num
+        blocks = []
+        for _ in range(encoder_layer_num):
+            # f_func = MHABlock(embedding_dim, head_num)
+            f_func = EncoderLayer(embedding_dim, head_num, qkv_dim)
+            # f_func = MLLABlock(embedding_dim, head_num, qkv_bias=True, drop_path=0.)
+            # f_func = NormLinearAttention(embedding_dim, intermediate_dim, head_num)
+
+            # g_func = SwishGLU(embedding_dim, hidden_dim, 0.1, nn.SiLU(), True, False, False, False)
+            g_func = FeedForward(**model_params)
+            # g_func = FFBlock(embedding_dim, intermediate_dim)
+            # g_func_mid = MSCFFN_step1(embedding_dim, intermediate_dim)
+            # g_func = MSCFFN_step2(g_func_mid, embedding_dim, intermediate_dim)
+            # g_func = MSCFFN(embedding_dim, intermediate_dim)
+            # g_func = GLU(embedding_dim, intermediate_dim, act_fun=F.sigmoid)
+            # we construct a reversible block with our F and G functions
+            blocks.append(rv.ReversibleBlock(f_func, g_func, split_along_dim=-1))
+
+        self.sequence = rv.ReversibleSequence(nn.ModuleList(blocks))
+
+    # def forward(self, x, mask=None):
+    def forward(self, depot_xy, node_xy_demand_tw):
+        # depot_xy.shape: (batch, 1, 2)
+        # node_xy_demand_tw.shape: (batch, problem, 3/5) - based on self.problem
+
+        embedded_depot = self.embedding_depot(depot_xy)
+        # shape: (batch, 1, embedding)
+        embedded_node = self.embedding_node(node_xy_demand_tw)
+        # shape: (batch, problem, embedding)
+        
+    
+        out = torch.cat((embedded_depot, embedded_node), dim=1)
+        # shape: (batch, problem+1, embedding)
+    
+        out = torch.cat([out, out], dim=-1)
+        out = self.sequence(out)
+        return torch.stack(out.chunk(2, dim=-1))[-1]
+
+    
 class SINGLE_Encoder(nn.Module):
     def __init__(self, **model_params):
         super().__init__()
@@ -176,6 +267,7 @@ class EncoderLayer(nn.Module):
         super().__init__()
         self.model_params = model_params
         embedding_dim = self.model_params['embedding_dim']
+        hidden_dim = self.model_params['ff_hidden_dim']
         head_num = self.model_params['head_num']
         qkv_dim = self.model_params['qkv_dim']
 
@@ -184,15 +276,36 @@ class EncoderLayer(nn.Module):
         self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
         self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
 
+        self.to_reset_gate = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.SiLU()
+        )
+
+        self.FoucusAttention = FocusedLinearAttention(embedding_dim, head_num, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., focusing_factor=3)
+
+        # self.LinearAttention = LinearAttention(dim=embedding_dim, num_heads=head_num, qkv_bias=True)
+        
+        # self.single_headed_attn = SingleHeadedAttention(
+        #     dim = embedding_dim,
+        #     dim_qk = qkv_dim,
+        #     dim_value = qkv_dim * 4,
+        #     causal = True,
+        #     laplacian_attn_fn = False
+        # )
+
+        self.single_headed_attn = SingleHeadedAttention(dim=embedding_dim, dim_qk=qkv_dim, dim_value=qkv_dim*4, causal=True)
+
+        self.MambaAttention = MLLABlock(embedding_dim, head_num, qkv_bias=True, drop_path=0.)
         self.addAndNormalization1 = Add_And_Normalization_Module(**model_params)
+        # self.feedForward = SwishGLU(embedding_dim, hidden_dim, 0.1, nn.SiLU(), True, False, False, False)
         self.feedForward = FeedForward(**model_params)
         self.addAndNormalization2 = Add_And_Normalization_Module(**model_params)
 
     def forward(self, input1):
         """
         Two implementations:
-            norm_last: the original implementation of AM/POMO: MHA -> Add & Norm -> FFN/MOE -> Add & Norm
-            norm_first: the convention in NLP: Norm -> MHA -> Add -> Norm -> FFN/MOE -> Add
+            norm_last: the original implementation of AM/POMO: FoucusAttention -> Add & Norm -> FFN -> Add & Norm
+            norm_first: the convention in NLP: Norm -> MHA -> Add -> Norm -> FFN -> Add
         """
         # input.shape: (batch, problem, EMBEDDING_DIM)
         head_num = self.model_params['head_num']
@@ -203,9 +316,27 @@ class EncoderLayer(nn.Module):
         # q shape: (batch, HEAD_NUM, problem, KEY_DIM)
 
         if self.model_params['norm_loc'] == "norm_last":
-            out_concat = multi_head_attention(q, k, v)  # (batch, problem, HEAD_NUM*KEY_DIM)
+            # out_concat = multi_head_attention(q, k, v)  # (batch, problem, HEAD_NUM*KEY_DIM)
+            # out_concat = multi_head_attention(q, k, v)  # ablation 1: without FoucusAttention, using MHA
+            # out_concat = self.FoucusAttention(input1)  # using FoucusAttention
+            # out_concat = self.LinearAttention(input1)  # ablation 2:  with LinearAttention
+            out_concat = self.MambaAttention(input1)  # Master's Thesis work: with MambaAttention - FocusedAttentin - Normalization - Gated - SwishGLU
+            
             multi_head_out = self.multi_head_combine(out_concat)  # (batch, problem, EMBEDDING_DIM)
-            out1 = self.addAndNormalization1(input1, multi_head_out)
+
+
+            ######
+                # gated single head attention
+            ######
+            # attn_output = self.single_headed_attn(out_concat)
+
+            reset_gate = self.to_reset_gate(out_concat)
+            # update_gate = self.to_update_gate(ema_output)
+
+            gated_attn_output = out_concat * reset_gate
+
+            out1 = self.addAndNormalization1(input1, multi_head_out)  # orignal without gated single head attention
+            # out1 = self.addAndNormalization1(input1, gated_attn_output)
             out2 = self.feedForward(out1)
             out3 = self.addAndNormalization2(out1, out2)  # (batch, problem, EMBEDDING_DIM)
         else:
@@ -222,6 +353,164 @@ class EncoderLayer(nn.Module):
 ########################################
 # DECODER
 ########################################
+
+class Global_and_Local_Decoder(nn.Module):
+    def __init__(self, **model_params):
+        super().__init__()
+        self.model_params = model_params
+        self.problem = self.model_params['problem']
+        embedding_dim = self.model_params['embedding_dim']
+        head_num = self.model_params['head_num']
+        qkv_dim = self.model_params['qkv_dim']
+
+        # Determine input dimension based on problem type
+        if self.problem in ["CVRP", "VRPB"]:
+            attr_dim = 1
+        elif self.problem in ["OVRP", "OVRPB", "VRPTW", "VRPBTW", "VRPL", "VRPBL"]:
+            attr_dim = 2
+        elif self.problem in ["VRPLTW", "VRPBLTW", "OVRPL", "OVRPBL", "OVRPTW", "OVRPBTW"]:
+            attr_dim = 3
+        elif self.problem in ["OVRPLTW", "OVRPBLTW"]:
+            attr_dim = 4
+        else:
+            raise NotImplementedError
+            
+        # For local and global attention (shared query)
+        self.Wq_last = nn.Linear(embedding_dim + attr_dim, head_num * qkv_dim, bias=False)
+        
+        # Shared transformations for local attention
+        self.Wk = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        self.Wv = nn.Linear(embedding_dim, head_num * qkv_dim, bias=False)
+        
+        # Global feature enhancement
+        self.lp1 = nn.Linear(embedding_dim, embedding_dim)
+        self.lp2 = nn.Linear(embedding_dim, embedding_dim)
+        
+        # Global adapter for better differentiation between local and global attention
+        self.global_adapter = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LeakyReLU(0.1),
+            nn.LayerNorm(embedding_dim)
+        )
+        
+        # Efficient combined processing
+        self.multi_head_combine = nn.Linear(head_num * qkv_dim, embedding_dim)
+        
+        # Attention integration with residual connection
+        self.attention_integration = nn.Sequential(
+            nn.Linear(2 * embedding_dim, embedding_dim),
+            nn.LeakyReLU(0.1),
+            nn.LayerNorm(embedding_dim)
+        )
+        
+        # Context-aware gating mechanism
+        self.gate = nn.Sequential(
+            nn.Linear(2 * embedding_dim, embedding_dim),  # Takes both current node and global context
+            nn.Sigmoid()
+        )
+        
+        # Final projection with layer normalization for stability
+        self.final_projection = nn.Sequential(
+            nn.Linear(embedding_dim, embedding_dim),
+            nn.LeakyReLU(0.1),
+            nn.LayerNorm(embedding_dim)
+        )
+        
+        # Feature mixer for final compatibility scoring
+        self.compatibility_mixer = nn.Linear(embedding_dim, embedding_dim)
+
+        # Cached state
+        self.k = None
+        self.v = None
+        self.k_global = None
+        self.v_global = None
+        self.single_head_key = None
+        self.global_embedding = None
+        self.node_embeddings_refined = None
+
+    def set_kv(self, encoded_nodes):
+        # encoded_nodes.shape: (batch, problem+1, embedding)
+        head_num = self.model_params['head_num']
+        batch_size = encoded_nodes.size(0)
+        
+        # Compute global embedding with attention-weighted pooling
+        self.global_embedding = torch.max(encoded_nodes, dim=1, keepdim=True)[0]
+        
+        # Refine node embeddings with global context
+        node_projection = self.lp1(encoded_nodes)
+        global_projection = self.lp2(self.global_embedding).expand_as(encoded_nodes)
+        self.node_embeddings_refined = node_projection + global_projection
+        
+        # Pre-compute keys and values for local attention
+        self.k = reshape_by_heads(self.Wk(encoded_nodes), head_num=head_num)
+        self.v = reshape_by_heads(self.Wv(encoded_nodes), head_num=head_num)
+        
+        # Apply global adapter for better differentiation before computing global K,V
+        refined_for_global = self.global_adapter(self.node_embeddings_refined)
+        
+        # Compute global attention keys and values
+        self.k_global = reshape_by_heads(self.Wk(refined_for_global), head_num=head_num)
+        self.v_global = reshape_by_heads(self.Wv(refined_for_global), head_num=head_num)
+        
+        # Store compatibility key for final probability calculation
+        # Using the compatibility mixer for better feature integration
+        self.single_head_key = self.compatibility_mixer(self.node_embeddings_refined).transpose(1, 2)
+
+    def forward(self, encoded_last_node, attr, ninf_mask):
+        # encoded_last_node.shape: (batch, pomo, embedding)
+        # attr.shape: (batch, pomo, attr_dim)
+        # ninf_mask.shape: (batch, pomo, problem+1)
+
+        head_num = self.model_params['head_num']
+        batch_size = encoded_last_node.size(0)
+        pomo_size = encoded_last_node.size(1)
+
+        # Prepare shared query vector
+        query_input = torch.cat((encoded_last_node, attr), dim=2)
+        q = reshape_by_heads(self.Wq_last(query_input), head_num=head_num)
+        
+        # Compute local and global attention in parallel
+        local_attn_out = multi_head_attention(q, self.k, self.v, rank3_ninf_mask=ninf_mask)
+        global_attn_out = multi_head_attention(q, self.k_global, self.v_global, rank3_ninf_mask=ninf_mask)
+        
+        # Process attention outputs
+        local_features = self.multi_head_combine(local_attn_out)
+        global_features = self.multi_head_combine(global_attn_out)
+        
+        # Element-wise compatibility and feature combination
+        compatibility = local_features * global_features
+        combined_features = torch.cat([compatibility, global_features], dim=2)
+        
+        # Integrate attention information with a residual connection
+        unified_attention = self.attention_integration(combined_features) + encoded_last_node
+        
+        # Prepare gating inputs
+        # Global context for current state
+        current_global_context = self.global_embedding.expand(batch_size, pomo_size, -1)
+        gate_inputs = torch.cat([encoded_last_node, current_global_context], dim=2)
+        
+        # Apply context-aware gating mechanism
+        gate_values = self.gate(gate_inputs)
+        gated_output = gate_values * unified_attention + (1 - gate_values) * encoded_last_node
+        
+        # Final projection with normalization for stable training
+        final_output = self.final_projection(gated_output)
+        
+        # Compute logits
+        score = torch.matmul(final_output, self.single_head_key)
+        
+        # Scale and clip logits
+        sqrt_embedding_dim = self.model_params['sqrt_embedding_dim']
+        logit_clipping = self.model_params['logit_clipping']
+        score_scaled = score / sqrt_embedding_dim
+        score_clipped = logit_clipping * torch.tanh(score_scaled)
+        
+        # Apply mask and get probabilities
+        score_masked = score_clipped + ninf_mask
+        probs = F.softmax(score_masked, dim=2)
+        
+        return probs
+
 
 class SINGLE_Decoder(nn.Module):
     def __init__(self, **model_params):
@@ -379,6 +668,22 @@ def multi_head_attention(q, k, v, rank2_ninf_mask=None, rank3_ninf_mask=None):
 
     return out_concat
 
+# functions
+
+def exists(val):
+    return val is not None
+
+def identity(t, *args, **kwargs):
+    return t
+
+def default(val, d):
+    return val if exists(val) else d
+
+def append_dims(x, num_dims):
+    if num_dims <= 0:
+        return x
+    return x.view(*x.shape, *((1,) * num_dims))
+
 
 class Add_And_Normalization_Module(nn.Module):
     def __init__(self, **model_params):
@@ -393,6 +698,12 @@ class Add_And_Normalization_Module(nn.Module):
             self.norm = nn.InstanceNorm1d(embedding_dim, affine=True, track_running_stats=False)
         elif model_params["norm"] == "layer":
             self.norm = nn.LayerNorm(embedding_dim)
+        elif model_params["norm"] == "GatedRMSNorm":
+            self.norm = GatedRMSNorm(embedding_dim)
+        elif model_params["norm"] == "simpleRMSNorm":
+            self.norm = SimpleRMSNorm(embedding_dim)
+        elif model_params["norm"] == "RMSNorm":
+            self.norm = RMSNorm(embedding_dim)
         elif model_params["norm"] == "rezero":
             self.norm = torch.nn.Parameter(torch.Tensor([0.]), requires_grad=True)
         else:
@@ -408,6 +719,15 @@ class Add_And_Normalization_Module(nn.Module):
             # shape: (batch, embedding, problem)
             back_trans = normalized.transpose(1, 2)
             # shape: (batch, problem, embedding)
+        elif isinstance(self.norm, GatedRMSNorm):
+            added = input1 + input2 if self.add else input2
+            normalized = self.norm(added)
+        elif isinstance(self.norm, SimpleRMSNorm):
+            added = input1 + input2 if self.add else input2
+            normalized = self.norm(added)
+        elif isinstance(self.norm, RMSNorm):
+            added = input1 + input2 if self.add else input2
+            normalized = self.norm(added)
         elif isinstance(self.norm, nn.BatchNorm1d):
             added = input1 + input2 if self.add else input2
             batch, problem, embedding = added.size()
@@ -424,6 +744,468 @@ class Add_And_Normalization_Module(nn.Module):
         return back_trans
 
 
+class MLLABlock(nn.Module):
+    r""" MLLA Block.
+
+    Args:
+        dim (int): Number of input channels.
+        input_resolution (tuple[int]): Input resulotion.
+        num_heads (int): Number of attention heads.
+        mlp_ratio (float): Ratio of mlp hidden dim to embedding dim.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+        drop (float, optional): Dropout rate. Default: 0.0
+        drop_path (float, optional): Stochastic depth rate. Default: 0.0
+        act_layer (nn.Module, optional): Activation layer. Default: nn.GELU
+        norm_layer (nn.Module, optional): Normalization layer.  Default: nn.LayerNorm
+    """
+
+    # def __init__(self, dim, input_resolution, num_heads, mlp_ratio=4., qkv_bias=True, drop=0., drop_path=0.,
+    #              act_layer=nn.GELU, norm_layer=nn.LayerNorm, **kwargs):
+    def __init__(self, dim, num_heads, qkv_bias=True, drop_path=0., **kwargs):
+        super().__init__()
+        self.dim = dim
+        # self.input_resolution = input_resolution
+        self.num_heads = num_heads
+        # self.mlp_ratio = mlp_ratio
+
+        # self.cpe1 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        # self.norm1 = norm_layer(dim)
+        self.in_proj = nn.Linear(dim, dim)
+        self.act_proj = nn.Linear(dim, dim)
+        # self.dwc = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        # self.act = nn.SiLU()
+        # self.act = nn.ReLU()
+        self.act = get_activation_fn("leaky_relu")
+        #######
+            # varient Attentions
+        #######
+        self.attn = FocusedLinearAttention(dim, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0., focusing_factor=3)
+        # self.attn = LinearAttentionforCTSP(dim=dim, num_heads=num_heads, qkv_bias=qkv_bias)
+        # self.attn = AgentAttentionforCTSP(dim=dim, num_heads=num_heads)
+        # self.attn = NormLinearAttention(embed_dim=dim, hidden_dim=dim*4, num_heads=num_heads)
+        self.out_proj = nn.Linear(dim, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        
+        # self.cpe2 = nn.Conv2d(dim, dim, 3, padding=1, groups=dim)
+        # self.norm2 = norm_layer(dim)
+        # self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+
+    def forward(self, x):
+        # H, W = self.input_resolution
+        # B, L, C = x.shape
+        # assert L == H * W, "input feature has wrong size"
+
+        # x = x + self.cpe1(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
+        shortcut = x
+
+        # x = self.norm1(x)
+        # step1 - right_side: Linear + ReLU
+        act_res = self.act(self.act_proj(x))
+        # x = self.in_proj(x).view(B, H, W, C)
+        # step1 - left_side: Linear + (Conv) + ReLU
+        x = self.in_proj(x)
+        # x = self.act(self.dwc(x.permute(0, 3, 1, 2))).permute(0, 2, 3, 1).view(B, L, C)
+        x = self.act(x)
+
+        # step2 - Linear Attention
+        # 生成 Q, K, V：通过线性层将输入特征映射为查询、键和值, 生成 Q, K, V：通过线性层将输入特征映射为查询、键和值
+        x = self.attn(x)
+
+        # step3 - step2 - Linear Attention * step1 - right_side
+        x = self.out_proj(x * act_res)
+        # 随机深度模块 Stochastic Depth, 在训练期间以一定概率丢弃输入数据，从而增强模型的正则化效果
+        # x = self.drop_path(x)
+        x = shortcut + self.drop_path(x)
+        # x = x + self.cpe2(x.reshape(B, H, W, C).permute(0, 3, 1, 2)).flatten(2).permute(0, 2, 1)
+
+        # FFN
+        # x = x + self.drop_path(self.mlp(self.norm2(x)))
+        return x
+
+    def extra_repr(self) -> str:
+        return f"dim={self.dim}, input_resolution={self.input_resolution}, num_heads={self.num_heads}, " \
+               f"mlp_ratio={self.mlp_ratio}"
+
+
+
+########################################
+# Norm Linear Attention
+# Code: https://github.com/Doraemonzzz/transnormer-v2-pytorch/blob/main/transnormer_v2/norm_linear_attention.py
+# Paper: https://www.semanticscholar.org/reader/e3fc46d5f4aae2c7a8a86b6bd21ca8db5d40fcbd
+########################################
+
+def get_activation_fn(activation):
+    logger.info(f"activation: {activation}")
+    if activation == "gelu":
+        return F.gelu
+    elif activation == "relu":
+        return F.relu
+    elif activation == "elu":
+        return F.elu
+    elif activation == "sigmoid":
+        return F.sigmoid
+    elif activation == "exp":
+        return torch.exp
+    elif activation == "leak":
+        return F.leaky_relu
+    elif activation == "1+elu":
+        def f(x):
+            # 调用自定义函数F.elu对x进行处理
+            # F.elu是一个自定义函数，可能用于计算指数线性单元（ELU）激活函数
+            return 1 + F.elu(x)
+        return f
+    elif activation == "2+elu":
+            def f(x):
+                return 2 + F.elu(x)
+            return f
+    elif activation == "silu":
+        return F.silu
+    elif activation == "Leaky ReLU":
+        return lambda x: F.leaky_relu(x, negative_slope=0.2)
+    else:
+        return lambda x: x
+    
+def get_norm_fn(norm_type):
+    if norm_type == "layernorm":
+        return nn.LayerNorm
+    elif norm_type == "batchnorm":
+        return nn.BatchNorm1d
+    elif norm_type == "instancenorm":
+        return nn.InstanceNorm1d
+    else:
+        # 默认返回 layernorm 或者不做处理
+        return nn.BatchNorm1d
+
+
+
+class LaplacianAttnFn(nn.Module):
+    def forward(self, x):
+        mu = math.sqrt(0.5)
+        std = math.sqrt((4 * math.pi) ** -1)
+        return (1 + torch.special.erf((x - mu) / (std * math.sqrt(2)))) * 0.5
+
+class SingleHeadedAttention(nn.Module):
+    def __init__(
+            self,
+            *,
+            dim,
+            dim_qk,
+            dim_value,
+            causal=False,
+            laplacian_attn_fn=False
+    ):
+        super().__init__()
+        self.causal = causal
+        self.laplacian_attn_fn = laplacian_attn_fn
+
+        # Attention function choice (either softmax or Laplacian)
+        self.attn_fn = F.softmax if not laplacian_attn_fn else LaplacianAttnFn()
+
+        # Linear transformations for QK and V
+        self.to_qk = nn.Sequential(
+            nn.Linear(dim, dim_qk),
+            nn.SiLU()  # SiLU activation for non-linearity
+        )
+        self.to_v = nn.Sequential(
+            nn.Linear(dim, dim_value),
+            nn.SiLU()  # SiLU activation for non-linearity
+        )
+
+    def forward(self, x, v_input=None):
+        seq_len, dim, device, dtype = *x.shape[-2:], x.device, x.dtype
+        v_input = v_input if v_input is not None else x
+
+        # Compute Q, K, V
+        qk, v = self.to_qk(x), self.to_v(v_input)
+        q, k = qk, qk  # Using self-attention, so Q = K
+
+        # Scaling factor
+        scale = seq_len ** -0.5 if self.laplacian_attn_fn else dim ** -0.5
+
+        # Compute similarity (scaled dot-product attention)
+        sim = einsum('b i d, b j d -> b i j', q, k) * scale
+
+        if self.causal:
+            causal_mask = torch.triu(torch.ones((seq_len, seq_len), device=device, dtype=torch.bool), diagonal=1)
+            sim = sim.masked_fill(causal_mask, -torch.finfo(sim.dtype).max)
+
+        # Apply attention function (softmax or Laplacian-based)
+        attn = self.attn_fn(sim, dim=-1)
+
+        if self.causal and self.laplacian_attn_fn:
+            # If using Laplacian attention, zero out upper triangular part of the attention matrix
+            attn = attn.masked_fill(causal_mask, 0.)
+
+        # Compute the final output by applying attention to values
+        return einsum('b i j, b j d -> b i d', attn, v)
+
+####################
+    # Normalization -- RMSNorm / SimpleRMSNorm / GatedRMSNorm
+####################
+
+
+class SimpleRMSNorm(nn.Module):
+    def __init__(self, d, p=-1., eps=1e-8, bias=False):
+        """
+            Root Mean Square Layer Normalization
+        :param d: model size
+        :param p: partial RMSNorm, valid value [0, 1], default -1.0 (disabled)
+        :param eps:  epsilon value, default 1e-8
+        :param bias: whether use bias term for RMSNorm, disabled by
+            default because RMSNorm doesn't enforce re-centering invariance.
+        """
+        super(SimpleRMSNorm, self).__init__()
+        self.eps = eps
+        self.d = d
+
+    def forward(self, x):
+        norm_x = x.norm(2, dim=-1, keepdim=True)
+        d_x = self.d
+
+        rms_x = norm_x * d_x ** (-1. / 2)
+        x_normed = x / (rms_x + self.eps)
+
+        return x_normed
+
+
+
+class RMSNorm(nn.Module):
+    def __init__(self, d, p=-1., eps=1e-8, bias=False):
+        """
+            Root Mean Square Layer Normalization
+        :param d: model size
+        :param p: partial RMSNorm, valid value [0, 1], default -1.0 (disabled)
+        :param eps:  epsilon value, default 1e-8
+        :param bias: whether use bias term for RMSNorm, disabled by
+            default because RMSNorm doesn't enforce re-centering invariance.
+        """
+        super(RMSNorm, self).__init__()
+
+        self.eps = eps
+        self.d = d
+        self.p = p
+        self.bias = bias
+
+        self.scale = nn.Parameter(torch.ones(d))
+        self.register_parameter("scale", self.scale)
+
+        if self.bias:
+            self.offset = nn.Parameter(torch.zeros(d))
+            self.register_parameter("offset", self.offset)
+
+    def forward(self, x):
+        if self.p < 0. or self.p > 1.:
+            norm_x = x.norm(2, dim=-1, keepdim=True)
+            d_x = self.d
+        else:
+            partial_size = int(self.d * self.p)
+            partial_x, _ = torch.split(x, [partial_size, self.d - partial_size], dim=-1)
+
+            norm_x = partial_x.norm(2, dim=-1, keepdim=True)
+            d_x = partial_size
+
+        rms_x = norm_x * d_x ** (-1. / 2)
+        x_normed = x / (rms_x + self.eps)
+
+        if self.bias:
+            return self.scale * x_normed + self.offset
+
+        return self.scale * x_normed
+    
+
+class GatedRMSNorm(nn.Module):
+    def __init__(self, d, eps=1e-8, bias=False):
+        """
+            Root Mean Square Layer Normalization
+        :param d: model size
+        :param eps:  epsilon value, default 1e-8
+        :param bias: whether use bias term for RMSNorm, disabled by
+            default because RMSNorm doesn't enforce re-centering invariance.
+        """
+        super(GatedRMSNorm, self).__init__()
+
+        self.eps = eps
+        self.d = d
+        self.bias = bias
+
+        self.scale = nn.Parameter(torch.ones(d))
+        self.register_parameter("scale", self.scale)
+        self.gate = nn.Parameter(torch.ones(d))
+        self.register_parameter("scale", self.scale)
+
+
+    def forward(self, x):
+        norm_x = x.norm(2, dim=-1, keepdim=True)
+        d_x = self.d
+
+        rms_x = norm_x * d_x ** (-1. / 2)
+        x_normed = x / (rms_x + self.eps)
+
+        return self.scale * x_normed * torch.sigmoid(self.gate * x)
+
+
+
+####################
+    # Attention module -- FocusedLinearAttention
+####################
+
+
+class FocusedLinearAttention(nn.Module):
+
+    def __init__(self, dim, num_heads, qkv_bias=True, qk_scale=None, attn_drop=0., proj_drop=0.,
+                 focusing_factor=3):
+
+        super().__init__()
+        self.dim = dim
+        # self.window_size = window_size  # Wh, Ww
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+
+        self.focusing_factor = focusing_factor
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+        #################
+            # Key & Query Norm - paper: https://arxiv.org/pdf/2302.05442
+            # Key & Query Norm - Code : https://github.com/kyegomez/MegaVIT/blob/main/mega_vit/main.py
+            # Key Norm (Jianlin Su): https://spaces.ac.cn/archives/9859
+        #################
+        # Use RMSNorm for query and key normalization
+        self.rms_norm_q = RMSNorm(head_dim)
+        self.rms_norm_k = RMSNorm(head_dim)
+
+        self.scale = nn.Parameter(torch.zeros(size=(1, 1, dim)))
+
+        self.softmax = nn.Softmax(dim=-1)
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: input features with shape of (num_windows*B, N, C)
+            mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
+        """
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, C).permute(2, 0, 1, 3)
+        q, k, v = qkv.unbind(0)
+
+        # k = k + self.positional_encoding
+        focusing_factor = self.focusing_factor
+        kernel_function = nn.ReLU()
+        # Apply ReLU and small constant
+        q = kernel_function(q) + 1e-6
+        k = kernel_function(k) + 1e-6
+        # Apply RMSNorm for query and key normalization
+        # q = self.rms_norm_q(q)
+        # k = self.rms_norm_k(k)
+        # Apply scale
+        scale = nn.Softplus()(self.scale)
+        q = q / scale
+        k = k / scale
+
+        q_norm = q.norm(dim=-1, keepdim=True)
+        k_norm = k.norm(dim=-1, keepdim=True)
+
+        # Apply focusing factor (keeping this part)
+        q = q ** focusing_factor
+        k = k ** focusing_factor
+        # Remove L2Norm, directly normalize q and k based on RMSNorm outputs
+        q = (q / q.norm(dim=-1, keepdim=True)) * q.norm(dim=-1, keepdim=True)
+        k = (k / k.norm(dim=-1, keepdim=True)) * k.norm(dim=-1, keepdim=True)
+        # 重新调整了查询（q）、键（k）和值（v）的形状，使得它们适应多头注意力机制
+        q = q.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+        k = k.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+        v = v.reshape(B, N, self.num_heads, -1).permute(0, 2, 1, 3)
+        # 计算了注意力权重 z，它通过查询（q）和键（k）之间的点积来计算
+        # 点积得到的结果通过平均和转置操作进行调整, 加入的小常数 1e-6 用于防止数值不稳定
+        z = 1 / (q @ k.mean(dim=-2, keepdim=True).transpose(-2, -1) + 1e-6)
+        # 计算值（v）和键（k）的加权求和，得到加权后的值 kv
+        kv = (k.transpose(-2, -1) * (N ** -0.5)) @ (v * (N ** -0.5))
+        # 算了最终的输出，q 和 kv 通过点积得到加权结果，然后乘上权重 z
+        x = q @ kv * z
+
+        # H = W = int(N ** 0.5)
+        # 将计算的结果进行维度转换，准备进入后续的投影层
+        x = x.transpose(1, 2).reshape(B, N, C)
+
+        head_dim = C // self.num_heads
+        assert C % self.num_heads == 0, "Embedding dimension C must be divisible by num_heads"
+
+        # 对值 v 进行处理，确保其适应后续计算
+        v = v.reshape(B, N, self.num_heads, head_dim).permute(0, 2, 1, 3)  # (B, heads, nodes, head_dim)
+        v = v.reshape(B * self.num_heads, N, head_dim)  # (batch*heads, nodes, head_dim)
+        # x = x + self.dwc(v).reshape(B, C, N).permute(0, 2, 1)
+
+        # 通过 self.proj 进行线性变换，然后通过 self.proj_drop 进行 dropout，最终输出处理后的 x
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def eval(self):
+        super().eval()
+        print('eval')
+
+    def extra_repr(self) -> str:
+        return f'dim={self.dim}, window_size={self.window_size}, num_heads={self.num_heads}'
+
+####################
+    # FFN module -- SwishGLU
+####################
+
+class SwishGLU(Module):
+    """
+    ## FFN module -- SwishGLU
+    """
+
+    def __init__(self, d_model: int, d_ff: int,
+                 dropout: float = 0.1,
+                 activation=nn.SiLU(),
+                 is_gated: bool = False,
+                 bias1: bool = True,
+                 bias2: bool = True,
+                 bias_gate: bool = True):
+        """
+        * `d_model` is the number of features in a token embedding
+        * `d_ff` is the number of features in the hidden layer of the FFN
+        * `dropout` is dropout probability for the hidden layer
+        * `is_gated` specifies whether the hidden layer is gated
+        * `bias1` specified whether the first fully connected layer should have a learnable bias
+        * `bias2` specified whether the second fully connected layer should have a learnable bias
+        * `bias_gate` specified whether the fully connected layer for the gate should have a learnable bias
+        """
+        super().__init__()
+        # Layer one parameterized by weight $W_1$ and bias $b_1$
+        self.layer1 = nn.Linear(d_model, d_ff, bias=bias1)
+        # Layer one parameterized by weight $W_1$ and bias $b_1$
+        self.layer2 = nn.Linear(d_ff, d_model, bias=bias2)
+        # Hidden layer dropout
+        self.dropout = nn.Dropout(dropout)
+        # Activation function $f$
+        self.activation = activation
+        # Whether there is a gate
+        self.is_gated = is_gated
+        if is_gated:
+            # If there is a gate the linear layer to transform inputs to
+            # be multiplied by the gate, parameterized by weight $V$ and bias $c$
+            self.linear_v = nn.Linear(d_model, d_ff, bias=bias_gate)
+
+    def forward(self, x: torch.Tensor):
+        # $f(x W_1 + b_1)$
+        g = self.activation(self.layer1(x))
+        # If gated, $f(x W_1 + b_1) \otimes (x V + b) $
+        if self.is_gated:
+            x = g * self.linear_v(x)
+        # Otherwise
+        else:
+            x = g
+        # Apply dropout
+        x = self.dropout(x)
+        # $(f(x W_1 + b_1) \otimes (x V + b)) W_2 + b_2$ or $f(x W_1 + b_1) W_2 + b_2$
+        # depending on whether it is gated
+        return self.layer2(x)
+
+
 class FeedForward(nn.Module):
     def __init__(self, **model_params):
         super().__init__()
@@ -437,3 +1219,196 @@ class FeedForward(nn.Module):
         # input.shape: (batch, problem, embedding)
 
         return self.W2(F.relu(self.W1(input1)))
+
+####################
+    # Ablation: LinearAttentionfor
+####################
+
+class LinearAttention(nn.Module):
+    """ Simplified Linear Attention.
+
+    Args:
+        dim (int): Number of input channels (embedding dimension).
+        num_heads (int): Number of attention heads.
+        qkv_bias (bool, optional): If True, add a learnable bias to query, key, value. Default: True
+    """
+
+    def __init__(self, dim, num_heads, qkv_bias=True, **kwargs):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads  # 每个头的维度
+        self.scale = self.head_dim ** -0.5  # 缩放因子，用于稳定训练
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)  # 生成 Q, K, V
+        self.out_proj = nn.Linear(dim, dim)  # 输出投影
+
+    def forward(self, x):
+        """
+        Args:
+            x: Input tensor with shape (batch_size, sequence_length, embedding_dim)
+        Returns:
+            Tensor with shape (batch_size, sequence_length, embedding_dim)
+        """
+        batch_size, sequence_length, embedding_dim = x.shape
+        assert embedding_dim == self.dim, "Input embedding_dim must match initialized dim"
+
+        # Step 1: Compute Q, K, V
+        qkv = self.qkv(x)  # Shape: (batch_size, sequence_length, 3 * embedding_dim)
+        qkv = qkv.view(batch_size, sequence_length, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.permute(2, 0, 3, 1, 4)  # Shapes: (batch_size, num_heads, sequence_length, head_dim)
+
+        # Step 2: Linear Attention
+        # Apply softmax along sequence_length for K
+        k = k.softmax(dim=-2)  # Normalize along sequence length
+        q = q * self.scale  # Scale Q
+
+        # Compute attention scores: (batch_size, num_heads, sequence_length, sequence_length)
+        context = torch.einsum("bhlk,bhlv->bhlv", k, v)  # Weighted sum of V
+        x = torch.einsum("bhlv,bhlk->bhlv", q, context)  # Q * Context
+
+        # Step 3: Reshape and project output
+        x = x.permute(0, 2, 1, 3).reshape(batch_size, sequence_length, embedding_dim)  # Combine heads
+        x = self.out_proj(x)  # Final linear projection
+
+        return x
+
+########################################
+# Norm Linear Attention (for CTSP)
+# Code: https://github.com/Doraemonzzz/transnormer-v2-pytorch/blob/main/transnormer_v2/norm_linear_attention.py
+# Paper: https://www.semanticscholar.org/reader/e3fc46d5f4aae2c7a8a86b6bd21ca8db5d40fcbd
+########################################
+
+def get_activation_fn(activation):
+    logger.info(f"activation: {activation}")
+    if activation == "gelu":
+        return F.gelu
+    elif activation == "relu":
+        return F.relu
+    elif activation == "elu":
+        return F.elu
+    elif activation == "sigmoid":
+        return F.sigmoid
+    elif activation == "exp":
+        return torch.exp
+    elif activation == "leak":
+        return F.leaky_relu
+    elif activation == "1+elu":
+        def f(x):
+            # 调用自定义函数F.elu对x进行处理
+            # F.elu是一个自定义函数，可能用于计算指数线性单元（ELU）激活函数
+            return 1 + F.elu(x)
+        return f
+    elif activation == "2+elu":
+            def f(x):
+                return 2 + F.elu(x)
+            return f
+    elif activation == "silu":
+        return F.silu
+    elif activation == "Leaky ReLU":
+        return lambda x: F.leaky_relu(x, negative_slope=0.2)
+    else:
+        return lambda x: x
+    
+def get_norm_fn(norm_type):
+    if norm_type == "layernorm":
+        return nn.LayerNorm
+    elif norm_type == "batchnorm":
+        return nn.BatchNorm1d
+    elif norm_type == "instancenorm":
+        return nn.InstanceNorm1d
+    else:
+        # 默认返回 layernorm 或者不做处理
+        return nn.BatchNorm1d
+
+
+class NormLinearAttention(nn.Module):
+    def __init__(
+        self,
+        embed_dim,
+        hidden_dim,
+        num_heads,
+        act_fun="leaky_relu",
+        uv_act_fun="silu",
+        # act_fun="elu",
+        # uv_act_fun="swish",
+        # norm_type="instancenorm", # optional: layernorm / batchnorm / instancenorm
+        norm_type="layernorm", # optional: layernorm / batchnorm / instancenorm
+        causal=False,
+    ):
+        super().__init__()
+        self.q_proj = nn.Linear(embed_dim, hidden_dim)
+        self.k_proj = nn.Linear(embed_dim, hidden_dim)
+        self.v_proj = nn.Linear(embed_dim, hidden_dim)
+        self.u_proj = nn.Linear(embed_dim, hidden_dim)
+        self.out_proj = nn.Linear(hidden_dim, embed_dim)
+        self.act = get_activation_fn(act_fun)
+        self.uv_act = get_activation_fn(uv_act_fun)
+        self.num_heads = num_heads
+        # self.norm = get_norm_fn(norm_type)(hidden_dim)
+        self.norm_type = norm_type
+        NormLayer = get_norm_fn(norm_type)
+        if norm_type == "layernorm":
+            # LayerNorm 通常直接传维度 hidden_dim 即可
+            self.norm = NormLayer(hidden_dim)
+        else:
+            # BatchNorm1d / InstanceNorm1d 对“通道数”做归一化，这里相当于 hidden_dim 为 channel
+            self.norm = NormLayer(hidden_dim, affine=True)
+        self.causal = causal
+        
+    def forward(
+        self,
+        x,
+        y=None,
+        attn_mask=None,
+    ):
+        # x: b n d
+        if y == None:
+            y = x
+        n = x.shape[-2]
+        # linear map
+        q = self.q_proj(x)
+        u = self.u_proj(x)
+        k = self.k_proj(y)
+        v = self.v_proj(y)
+        # uv act
+        u = self.uv_act(u)
+        v = self.uv_act(v)
+        # reshape
+        q, k, v = map(lambda x: rearrange(x, '... n (h d) -> ... h n d', h=self.num_heads), [q, k, v])
+        # act
+        q = self.act(q)
+        k = self.act(k)
+        
+        if self.causal:
+            if (attn_mask == None):
+                attn_mask = (torch.tril(torch.ones(n, n))).to(q)
+            l1 = len(q.shape)
+            l2 = len(attn_mask.shape)
+            for _ in range(l1 - l2):
+                attn_mask = attn_mask.unsqueeze(0)
+            energy = torch.einsum('... n d, ... m d -> ... n m', q, k)
+            energy = energy * attn_mask
+            output = torch.einsum('... n m, ... m d -> ... n d', energy, v)
+        else:
+            kv = torch.einsum('... n d, ... n e -> ... d e', k, v)
+            output = torch.einsum('... n d, ... d e -> ... n e', q, kv)
+        # reshape
+        output = rearrange(output, '... h n d -> ... n (h d)')
+        # --- norm ---
+        # If layernorm, we can do self.norm(output) directly:
+        if self.norm_type == "layernorm":
+            output = self.norm(output)
+        else:
+            # If batchnorm / instancenorm, need (B, C, L) format
+            # 需要先把 (B, N, hidden_dim) -> (B, hidden_dim, N) 才能直接用 *Norm1d
+            output = output.transpose(1, 2)  # -> (B, hidden_dim, N)
+            output = self.norm(output)
+            output = output.transpose(1, 2)  # -> (B, N, hidden_dim)
+        # # normalize
+        # output = self.norm(output)
+        # gate
+        output = u * output
+        # outproj
+        output = self.out_proj(output)
+
+        return output
